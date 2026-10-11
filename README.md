@@ -22,10 +22,12 @@ cairn search webhook retry       # full-text search of every transcript, then pi
 cairn search -l webhook retry    # just list matches with snippets
 cairn pin ID… / unpin ID…        # keep active tasks at the top
 cairn archive ID… / unarchive    # hide finished work (comes back on new activity); ls --archived
+cairn show 35255c3f      # everything about one session: full summary, first/last prompt, branches
 cairn ui                 # dashboard at http://127.0.0.1:7444, filtered to this project and branch
 
 cairn summarize --dir ~/Code/app # summarize every session started in a dir (and below)
 cairn summarize --missing -n 20  # backfill sessions that have no summary yet
+                                 # (both say how many sessions and ask first; -y skips that)
 cairn config ticket_url 'https://linear.app/acme/issue/{ticket}'   # make ticket chips links
 cairn install / uninstall        # hooks + status line in ~/.claude/settings.json (backed up)
 ```

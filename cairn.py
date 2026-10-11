@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1007,6 +1008,7 @@ def row_json(r, live=None, ticket_url=""):
         "archived": is_archived(r),
         "status": (live or {}).get(r["id"]),
         "resume": resume_command(r),
+        "stale": bool(needs_summary(r, final=True) or needs_branch(r)),
     }
 
 
@@ -1177,8 +1179,36 @@ def cmd_mark(args):
     conn.commit()
 
 
-def cmd_summarize(args):
+SECONDS_PER_SUMMARY = 6  # typical Haiku call through `claude -p`, thinking off
+
+
+def summary_plan(n, jobs):
+    """'N sessions … about X' text used by the CLI prompt (the dashboard words it the same way)."""
+    secs = max(1, -(-n // max(1, jobs))) * SECONDS_PER_SUMMARY
+    eta = f"{secs}s" if secs < 90 else f"{round(secs / 60)} min"
+    return (f"You are going to create summaries for {n} session{'s' * (n != 1)}: "
+            f"{n} Haiku call{'s' * (n != 1)} on your Claude plan, about {eta} at {jobs} at a time.")
+
+
+def run_summaries(rows, jobs, fresh, on_done=None):
+    """Summarize rows in parallel; on_done(row, summary) after each. Returns (ok, failed)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def work(row):
+        return row, summarize(db(), row["id"], fresh=fresh)  # own connection per thread
+
+    ok = failed = 0
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        for fut in as_completed([pool.submit(work, r) for r in rows]):
+            row, summary = fut.result()
+            ok += bool(summary)
+            failed += not summary
+            if on_done:
+                on_done(row, summary)
+    return ok, failed
+
+
+def cmd_summarize(args):
 
     conn = db()
     sync(conn)
@@ -1202,20 +1232,57 @@ def cmd_summarize(args):
     if not rows:
         print("Nothing to summarize.")
         return
+    # Ask first, unless it's one session named explicitly or -y was given.
+    if not args.yes and not (args.ids and len(rows) == 1):
+        print(summary_plan(len(rows), args.jobs))
+        if not sys.stdin.isatty():
+            sys.exit("Not a terminal, so not asking: re-run with -y to go ahead.")
+        try:
+            if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Cancelled.")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return
     print(f"Summarizing {len(rows)} session{'s' * (len(rows) != 1)} with {SUMMARY_MODEL} ({args.jobs} at a time)…")
+    done = 0
 
-    def work(row):
-        return row, summarize(db(), row["id"], fresh=force)  # own connection per thread
+    def report(row, summary):
+        nonlocal done
+        done += 1
+        print(f"[{done}/{len(rows)}] {clip(display_name(row), 50)}  ({tilde(row['cwd'])})\n"
+              f"    {summary or '(failed or already running; see ~/.cairn/cairn.log)'}", flush=True)
 
-    done = failed = 0
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        for fut in as_completed([pool.submit(work, r) for r in rows]):
-            row, summary = fut.result()
-            done += 1
-            failed += not summary
-            print(f"[{done}/{len(rows)}] {clip(display_name(row), 50)}  ({tilde(row['cwd'])})\n"
-                  f"    {summary or '(failed or already running; see ~/.cairn/cairn.log)'}", flush=True)
-    print(f"Done: {done - failed} summarized, {failed} failed.")
+    ok, failed = run_summaries(rows, args.jobs, force, report)
+    print(f"Done: {ok} summarized, {failed} failed.")
+
+
+def cmd_show(args):
+    """Everything about one session, untruncated."""
+    conn = db()
+    sync(conn)
+    r = conn.execute("SELECT * FROM sessions WHERE id=?", (resolve_id(conn, args.id),)).fetchone()
+    status = live_statuses(conn).get(r["id"])
+    branches = json.loads(r["branches"] or "[]")
+    import textwrap
+    wrap = lambda t: textwrap.fill(" ".join(str(t).split()), 100, initial_indent="  ", subsequent_indent="  ")
+    print(f"{display_name(r)}{'  ★' if r['pinned'] else ''}{f'  [{status}]' if status else ''}")
+    print(f"  {r['id']}")
+    for label, value in (
+        ("Directory", tilde(r["cwd"])),
+        ("Branch", shown_branch(r) or "-"),
+        ("Earlier", ", ".join(b for b in branches if b != r["branch"]) or None),
+        ("Ticket", ticket_of(r)),
+        ("PR", r["pr_url"]),
+        ("Active", f"{ago(r['last_active'])} · started {ago(r['started_at'])} · {r['turns']} prompts"),
+    ):
+        if value:
+            print(f"  {label + ':':<10} {value}")
+    for label, text in (("Summary", r["summary"] or "(none yet: cairn summarize " + r["id"][:8] + ")"),
+                        ("First prompt", r["first_prompt"]), ("Last prompt", r["last_prompt"])):
+        if text:
+            print(f"\n{label}\n{wrap(text)}")
+    print(f"\nResume\n  {resume_command(r)}")
 
 
 def cmd_config(args):
@@ -1244,6 +1311,42 @@ def cmd_config(args):
 
 
 # --------------------------------------------------------------- dashboard
+
+class SummaryJob:
+    """One background batch at a time, started from the dashboard."""
+    lock = threading.Lock()
+    total = done = failed = 0
+    running = False
+
+    @classmethod
+    def start(cls, ids):
+        with cls.lock:
+            if cls.running:
+                return False
+            cls.total, cls.done, cls.failed, cls.running = len(ids), 0, 0, True
+        conn = db()
+        rows = [r for r in (conn.execute("SELECT * FROM sessions WHERE id=?", (i,)).fetchone() for i in ids) if r]
+
+        def progress(row, summary):
+            with cls.lock:
+                cls.done += 1
+                cls.failed += not summary
+
+        def run():
+            try:
+                run_summaries(rows, 4, False, progress)
+            finally:
+                with cls.lock:
+                    cls.running = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    @classmethod
+    def state(cls):
+        with cls.lock:
+            return {"running": cls.running, "total": cls.total, "done": cls.done, "failed": cls.failed}
+
 
 def make_handler():
     from http.server import BaseHTTPRequestHandler
@@ -1302,6 +1405,8 @@ def make_handler():
                 cfg = config()
                 rows = query_sessions(conn) + query_sessions(conn, archived=True)
                 return self.send_json({"sessions": [row_json(r, live, cfg["ticket_url"]) for r in rows]})
+            if url.path == "/api/summarize-batch":
+                return self.send_json(SummaryJob.state())
             if url.path == "/api/search":
                 hits = search_ids(db(), (q.get("q") or [""])[0])
                 return self.send_json({"hits": [{"id": k, "snippet": v} for k, v in hits.items()]})
@@ -1311,6 +1416,11 @@ def make_handler():
             if not self.local_only():
                 return
             url = urlparse(self.path)
+            if url.path == "/api/summarize-batch":
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                ids = [i for i in body.get("ids", []) if re.fullmatch(r"[0-9a-f-]{36}", str(i))]
+                started = bool(ids) and SummaryJob.start(ids)
+                return self.send_json({"started": started, **SummaryJob.state()})
             m = re.fullmatch(r"/api/(summarize|open|pin|archive)/([0-9a-f-]{36})", url.path)
             if not m:
                 return self.send_json({"error": "not found"}, 404)
@@ -1448,7 +1558,12 @@ def main():
     s.add_argument("-f", "--force", action="store_true", help="rewrite summaries from scratch even if up to date")
     s.add_argument("-j", "--jobs", type=int, default=4, help="parallel Haiku calls (default 4)")
     s.add_argument("-n", "--limit", type=int)
+    s.add_argument("-y", "--yes", action="store_true", help="don't ask before summarizing several sessions")
     s.set_defaults(fn=cmd_summarize)
+
+    s = sub.add_parser("show", help="full details of one session: summary, prompts, branches, resume command")
+    s.add_argument("id", help="session id or unique prefix")
+    s.set_defaults(fn=cmd_show)
 
     s = sub.add_parser("config", help="show or set options: " + ", ".join(DEFAULT_CONFIG))
     s.add_argument("key", nargs="?")
