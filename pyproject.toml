@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cairn-sessions"
+dynamic = ["version"]
+description = "Find the right Claude Code session and hop back into it"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []  # standard library only
+
+[project.scripts]
+cairn = "cairn.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/habibulloxon/cairn-cli"
+
+[tool.setuptools]
+packages = ["cairn"]
+
+[tool.setuptools.dynamic]
+version = { attr = "cairn.__version__" }

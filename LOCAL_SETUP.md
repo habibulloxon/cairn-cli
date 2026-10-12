@@ -1,19 +1,20 @@
-# Running cairn locally (CLI + UI)
+# Running cairn from source (CLI + UI)
 
-cairn is two repos that work together:
+Most people should install with Homebrew (`brew install habibulloxon/tap/cairn`). This guide is
+for working on cairn itself. It's two repos that work together:
 
 | Repo | What it is |
 |---|---|
-| [`cairn-cli`](https://github.com/habibulloxon/cairn-cli) | `cairn.py`: the indexer, Claude Code hooks, Haiku summaries, terminal picker, and the local server the dashboard talks to. Standard-library Python. |
+| [`cairn-cli`](https://github.com/habibulloxon/cairn-cli) | The `cairn` command: indexer, Claude Code hooks, Haiku summaries, terminal picker, and the local server the dashboard talks to. Standard-library Python. |
 | [`cairn-ui`](https://github.com/habibulloxon/cairn-ui) | The dashboard: React + shadcn/ui, built to static files that the CLI serves. |
 
 ## Requirements
 
-- macOS (Linux works too, except *Open in Ghostty*)
-- Python 3.10+ (no packages needed)
-- Node 20+ and npm (only to build the UI)
+- macOS or Linux (*Open in Ghostty* is macOS only)
+- Python 3.9+ (no packages needed)
+- Node 20+ and npm, to build the UI
 - [Claude Code](https://code.claude.com) logged in (`claude` on your `PATH`); summaries run through it
-- Optional: [fzf](https://github.com/junegunn/fzf) for the terminal picker, [Ghostty](https://ghostty.org) 1.3+ for *Open*
+- Optional: [fzf](https://github.com/junegunn/fzf) for the picker, [Ghostty](https://ghostty.org) 1.3+ for *Open*
 
 ## 1. Clone both, UI inside the CLI
 
@@ -25,8 +26,8 @@ git clone https://github.com/habibulloxon/cairn-cli.git ~/Code/cairn
 git clone https://github.com/habibulloxon/cairn-ui.git  ~/Code/cairn/ui
 ```
 
-Prefer them side by side? Clone the UI anywhere and point the CLI at its build:
-`export CAIRN_UI_DIST=~/Code/cairn-ui/dist` (in your shell profile).
+Prefer them side by side? Clone the UI anywhere and point the CLI at its build with
+`export CAIRN_UI_DIST=~/Code/cairn-ui/dist` in your shell profile.
 
 ## 2. Build the UI
 
@@ -36,43 +37,32 @@ npm install
 npm run build        # writes ui/dist, which `cairn serve` picks up
 ```
 
-## 3. Install the CLI
+## 3. Put `cairn` on your PATH and install the hooks
 
 ```bash
-chmod +x ~/Code/cairn/cairn.py
-ln -sf ~/Code/cairn/cairn.py ~/.local/bin/cairn   # any directory on your PATH
+ln -sf ~/Code/cairn/bin/cairn ~/.local/bin/cairn   # any directory on your PATH
 cairn install
 ```
 
-`cairn install` backs up `~/.claude/settings.json`, then adds cairn's hooks (SessionStart,
-UserPromptSubmit, PermissionRequest, PostToolUse, Stop, SessionEnd) and wraps your status line
-with a cairn line. It also indexes every existing transcript, so your history shows up right
-away. Hooks run with the Python that ran `cairn install`; re-run it if you switch Pythons or move
-the checkout. `cairn uninstall` removes everything it added (your data stays in `~/.cairn`).
+`cairn install` backs up `~/.claude/settings.json`, then adds the hooks and status line, which run
+`<the Python you ran it with> ~/Code/cairn/bin/cairn`. Re-run it if you move the checkout or
+switch Pythons; it replaces its old entries. `cairn uninstall` removes everything it added (your
+data stays in `~/.cairn`). Don't have both this and the Homebrew version installed: whichever ran
+`cairn install` last owns the hooks.
 
 Optional:
 
 ```bash
-cairn summarize --missing -n 20      # backfill summaries for existing sessions (~4s each, uses your plan)
-cairn config ticket_url 'https://linear.app/<team>/issue/{ticket}'   # make DEV-123 chips links
+cairn summarize --missing -n 20      # backfill summaries for existing sessions (asks first)
+cairn config ticket_url 'https://linear.app/<team>/issue/{ticket}'
 ```
 
-## 4. Use it
+## 4. Develop
 
 ```bash
-cairn               # pick a session from this project and resume it here
-cairn -g            # ...in a new Ghostty tab
-cairn ls            # table in the terminal
-cairn search webhook retry   # search inside every transcript
-cairn ui            # open the dashboard (starts the server on 127.0.0.1:7444)
-```
+python3 -m unittest discover -s tests -t .   # CLI tests; they never touch ~/.claude or ~/.cairn
 
-Everything is local: data in `~/.cairn`, the server listens on `127.0.0.1` only.
-
-## Working on the UI
-
-```bash
-cairn serve                  # API on 127.0.0.1:7444 (keep it running)
+cairn serve                         # API on 127.0.0.1:7444 (keep it running)
 cd ~/Code/cairn/ui && npm run dev   # hot-reloading UI; /api is proxied to cairn serve
 ```
 
@@ -85,3 +75,9 @@ git -C ~/Code/cairn pull
 git -C ~/Code/cairn/ui pull && (cd ~/Code/cairn/ui && npm install && npm run build)
 cairn install        # only needed if the hooks changed
 ```
+
+## Releasing
+
+Bump `__version__` in `cairn/__init__.py`, commit, then run `scripts/release.sh`. It runs the
+tests, builds the UI, uploads `cairn-<version>.tar.gz` (CLI + built dashboard) as a GitHub
+release, and updates `Formula/cairn.rb` in the tap (cloned at `../homebrew-tap`, or `$TAP_DIR`).
